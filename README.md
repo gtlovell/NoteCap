@@ -13,7 +13,6 @@ NoteCap is an Obsidian plugin that transforms your handwritten notes into search
 ## Requirements
 
 - Obsidian v0.15.0 or higher
-- [Text Extractor](https://github.com/scambier/obsidian-text-extractor) plugin installed
 
 ## Installation
 
@@ -83,7 +82,6 @@ MIT License. See [LICENSE](LICENSE) for more information.
 
 ## Credits
 
-- Built on top of the excellent [Text Extractor](https://github.com/scambier/obsidian-text-extractor) plugin
 - Created with 💜 for the Obsidian community
 
 ## Changelog
