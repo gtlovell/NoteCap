@@ -1,0 +1,10 @@
+{
+  "id": "notecap",
+  "name": "NoteCap",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Capture handwritten notes as searchable text with automatic tagging and backlinks",
+  "author": "Garrett Lovell",
+  "authorUrl": "https://github.com/gtlovell",
+  "isDesktopOnly": false
+}
