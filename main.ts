@@ -29,6 +29,8 @@ interface NotecapSettings {
   tagSuggestions: boolean;
   summarizeContent: boolean;
   maxTokens: number;
+  outputFolder: string;
+  imageFolder: string;
 }
 
 const DEFAULT_SETTINGS: NotecapSettings = {
@@ -43,6 +45,8 @@ const DEFAULT_SETTINGS: NotecapSettings = {
   tagSuggestions: true,
   summarizeContent: false,
   maxTokens: 1000,
+  outputFolder: "/",
+  imageFolder: "/NoteCaps/Images",
 };
 
 interface LLMResponse {
@@ -163,38 +167,27 @@ export default class NoteCap extends Plugin {
   async processImage(file: TFile) {
     try {
       new Notice("Starting image processing...");
-
-      // 1. Add debug logging
       console.log("Processing image:", file.path);
 
       let extractedText = "";
       let tags: string[] = [];
       let summary = "";
 
-      // 2. Read image file with proper error handling
+      // Read image file with proper error handling
       const imageData = await this.app.vault.readBinary(file);
       if (!imageData || imageData.byteLength === 0) {
         throw new Error("Image file is empty or couldn't be read");
       }
       console.log("Image data loaded, size:", imageData.byteLength);
 
-      // 3. Convert to base64 with verification
+      // Convert to base64 with verification
       const base64Image = await this.convertToBase64(imageData);
       if (!base64Image || !base64Image.startsWith("data:image")) {
         throw new Error("Invalid base64 image conversion");
       }
       console.log("Image converted to base64");
 
-      // 4. Process with selected method
-      if (
-        this.settings.useVisionForOcr &&
-        (!this.settings.llmProvider || this.settings.llmProvider === "none")
-      ) {
-        new Notice(
-          "Vision OCR requires an LLM provider. Please configure one in settings."
-        );
-        return false;
-      }
+      // Process with selected method
       if (this.settings.useVisionForOcr) {
         if (
           !this.settings.llmProvider ||
@@ -230,22 +223,63 @@ export default class NoteCap extends Plugin {
         }
       }
 
-      // 5. Verify extracted content
+      // Verify extracted content
       if (!extractedText.trim()) {
         throw new Error("No text was extracted from the image");
       }
       console.log("Extracted text length:", extractedText.length);
 
-      // 6. Create note content with proper formatting
-      let noteContent = `# ${file.basename}\n\n`;
-      noteContent += extractedText.trim();
+      // Generate title from extracted text
+      const noteTitle = await this.generateTitleFromContent(extractedText);
+      const safeTitle = this.formatTag(noteTitle);
+      console.log("Generated title:", noteTitle);
 
+      // Format tags with proper spacing/hyphens
+      const formattedTags = tags.map((tag) => this.formatTag(tag));
+
+      // Handle image moving first
+      const imageFolder = this.settings.imageFolder.replace(/^\/+|\/+$/g, "");
+
+      // Ensure image folder exists
+      if (!this.app.vault.getAbstractFileByPath(imageFolder)) {
+        await this.app.vault.createFolder(imageFolder);
+        console.log(`Created image folder: ${imageFolder}`);
+      }
+
+      // Construct new image path and move the file
+      const newImagePath = `${imageFolder}/${file.name}`;
+      console.log(`Moving image from ${file.path} to ${newImagePath}`);
+
+      try {
+        // Check if a file with the same name already exists in the target folder
+        const existingFile = this.app.vault.getAbstractFileByPath(newImagePath);
+        if (existingFile) {
+          await this.app.vault.delete(existingFile);
+          console.log(`Deleted existing file at ${newImagePath}`);
+        }
+
+        // Move the file
+        await this.app.vault.rename(file, newImagePath);
+        console.log(`Successfully moved image to ${newImagePath}`);
+      } catch (error) {
+        console.error("Error moving image:", error);
+        new Notice(`Failed to move image: ${error.message}`);
+      }
+
+      // Create note content
+      let noteContent = "";
+      const paragraphs = extractedText.trim().split(/\n+/);
+      noteContent += paragraphs.join("\n\n");
+
+      // Add other sections with proper spacing
       if (this.settings.summarizeContent && summary) {
         noteContent += `\n\n## Summary\n${summary.trim()}`;
       }
 
-      if (tags.length > 0) {
-        noteContent += `\n\n## Tags\n${tags.map((tag) => `#${tag}`).join(" ")}`;
+      if (formattedTags.length > 0) {
+        noteContent += `\n\n### Tags\n${formattedTags
+          .map((tag) => `#${tag}`)
+          .join(" ")}`;
       }
 
       if (this.settings.enableAutoBacklinks) {
@@ -257,21 +291,28 @@ export default class NoteCap extends Plugin {
         }
       }
 
-      // 7. Create note with proper path and error handling
-      const notePath = `${file.parent ? file.parent.path + "/" : ""}${
-        file.basename
-      }.md`;
+      // Add image link at the bottom
+      noteContent += `\n\n### Source Image\n[[${newImagePath}|View original image]]`;
+
+      // Create the note with proper path
+      const outputFolder = this.settings.outputFolder.replace(/^\/+|\/+$/g, "");
+      const notePath = outputFolder
+        ? `${outputFolder}/${safeTitle}.md`
+        : `${safeTitle}.md`;
+
       console.log("Creating note at path:", notePath);
 
-      const existingFile = this.app.vault.getAbstractFileByPath(notePath);
-      if (existingFile) {
-        await this.app.vault.delete(existingFile);
+      // Check for existing file and handle accordingly
+      const existingNote = this.app.vault.getAbstractFileByPath(notePath);
+      if (existingNote) {
+        await this.app.vault.delete(existingNote);
       }
 
+      // Create the new note
       await this.app.vault.create(notePath, noteContent);
       new Notice("Successfully processed handwritten note!");
 
-      // Optional: Open the new note
+      // Open the new note
       const newFile = this.app.vault.getAbstractFileByPath(notePath);
       if (newFile instanceof TFile) {
         await this.app.workspace.getLeaf().openFile(newFile);
@@ -281,8 +322,67 @@ export default class NoteCap extends Plugin {
       new Notice(
         `Failed to process image: ${error.message || "Unknown error"}`
       );
-      throw error; // Re-throw to ensure calling code knows about the failure
+      throw error;
     }
+  }
+
+  private async generateTitleFromContent(content: string): Promise<string> {
+    if (this.settings.llmProvider !== "none") {
+      try {
+        const prompt = `Generate a concise title (3-4 words maximum) for this text that captures its main topic. Format as plain text with no quotes or punctuation:\n\n${content}`;
+
+        if (this.settings.llmProvider === "openai") {
+          const response = await fetch(
+            "https://api.openai.com/v1/chat/completions",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${this.settings.openaiApiKey}`,
+              },
+              body: JSON.stringify({
+                model: "gpt-4",
+                messages: [{ role: "user", content: prompt }],
+                max_tokens: 20,
+                temperature: 0.3,
+              }),
+            }
+          );
+
+          if (!response.ok) throw new Error("OpenAI API error");
+          const result = await response.json();
+          return result.choices[0].message.content.trim();
+        } else if (this.settings.llmProvider === "anthropic") {
+          const response = await fetch(
+            "https://api.anthropic.com/v1/messages",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": this.settings.anthropicApiKey,
+                "anthropic-version": "2024-01-01",
+              },
+              body: JSON.stringify({
+                model: "claude-3-opus-20240229",
+                max_tokens: 20,
+                messages: [{ role: "user", content: prompt }],
+              }),
+            }
+          );
+
+          if (!response.ok) throw new Error("Anthropic API error");
+          const result = await response.json();
+          return result.content[0].text.trim();
+        }
+      } catch (error) {
+        console.error("Error generating title:", error);
+        return "Untitled Note";
+      }
+    }
+
+    // Fallback: Use first few words of content
+    const words = content.trim().split(/\s+/).slice(0, 4);
+    return words.join(" ").slice(0, 50) || "Untitled Note";
   }
 
   private async processWithTesseract(base64Image: string): Promise<string> {
@@ -534,6 +634,96 @@ export default class NoteCap extends Plugin {
     });
   }
 
+  private isCommonWord(word: string): boolean {
+    const commonWords = new Set([
+      "the",
+      "and",
+      "that",
+      "have",
+      "for",
+      "not",
+      "with",
+      "you",
+      "this",
+      "but",
+      "his",
+      "from",
+      "they",
+      "say",
+      "her",
+      "she",
+      "will",
+      "one",
+      "all",
+      "would",
+      "there",
+      "their",
+      "what",
+      "out",
+      "about",
+      "who",
+      "get",
+      "which",
+      "when",
+      "make",
+      "can",
+      "like",
+      "time",
+      "just",
+      "him",
+      "know",
+      "take",
+      "into",
+      "year",
+      "your",
+      "good",
+      "some",
+      "could",
+      "them",
+      "see",
+      "other",
+      "than",
+      "then",
+      "now",
+      "look",
+      "only",
+      "come",
+      "its",
+      "over",
+      "think",
+      "also",
+      "back",
+      "after",
+      "use",
+      "two",
+      "how",
+      "our",
+      "work",
+      "first",
+      "well",
+      "way",
+      "even",
+      "new",
+      "want",
+      "because",
+      "any",
+      "these",
+      "give",
+      "day",
+      "most",
+      "cant",
+    ]);
+    return commonWords.has(word.toLowerCase());
+  }
+
+  private formatTag(tag: string): string {
+    return tag
+      .toLowerCase()
+      .replace(/\s+/g, "-") // Replace spaces with hyphens
+      .replace(/[^a-z0-9-]/g, "") // Remove any other special characters
+      .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
+      .replace(/^-|-$/g, ""); // Remove leading/trailing hyphens
+  }
   async generateTags(text: string): Promise<string[]> {
     const tags = new Set<string>();
 
@@ -583,6 +773,32 @@ export default class NoteCap extends Plugin {
       "take",
     ]);
 
+    // Consider phrases (2-3 words) as potential tags
+    for (let i = 0; i < words.length; i++) {
+      // Single word
+      const singleWord = this.formatTag(words[i]);
+      if (singleWord.length > 3 && !this.isCommonWord(singleWord)) {
+        tags.add(singleWord);
+      }
+
+      // Two-word phrase
+      if (i < words.length - 1) {
+        const twoWords = this.formatTag(`${words[i]} ${words[i + 1]}`);
+        if (twoWords.length > 3) {
+          tags.add(twoWords);
+        }
+      }
+
+      // Three-word phrase
+      if (i < words.length - 2) {
+        const threeWords = this.formatTag(
+          `${words[i]} ${words[i + 1]} ${words[i + 2]}`
+        );
+        if (threeWords.length > 3) {
+          tags.add(threeWords);
+        }
+      }
+    }
     for (const word of words) {
       if (!commonWords.has(word)) {
         tags.add(word);
@@ -625,6 +841,7 @@ export default class NoteCap extends Plugin {
 
 class ImageUploadModal extends Modal {
   plugin: NoteCap;
+  private captureMode: "upload" | "camera" = "upload";
 
   constructor(app: App, plugin: NoteCap) {
     super(app);
@@ -632,38 +849,237 @@ class ImageUploadModal extends Modal {
   }
 
   onOpen() {
+    // Get rid of any existing content
     const { contentEl } = this;
+    contentEl.empty();
 
-    contentEl.createEl("h2", { text: "NoteCap: Upload Note" });
+    // Just create the button container and main buttons
+    const buttonContainer = contentEl.createEl("div", {
+      cls: "notecap-buttons",
+    });
 
-    const inputEl = contentEl.createEl("input", {
+    // Upload button
+    const uploadBtn = buttonContainer.createEl("button", {
+      cls: "notecap-action-btn",
+    });
+    uploadBtn.innerHTML = `
+      <svg class="notecap-icon" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/>
+      </svg>
+      <span>Upload Image</span>
+    `;
+
+    // Camera button
+    const cameraBtn = buttonContainer.createEl("button", {
+      cls: "notecap-action-btn",
+    });
+    cameraBtn.innerHTML = `
+      <svg class="notecap-icon" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm6-9h-1.7l-1.2-1.3c-.3-.3-.7-.5-1.1-.5h-4c-.4 0-.8.2-1.1.5L7.7 8H6c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-8c0-1.1-.9-2-2-2zM12 19c-2.2 0-4-1.8-4-4s1.8-4 4-4 4 1.8 4 4-1.8 4-4 4z"/>
+      </svg>
+      <span>Take Photo</span>
+    `;
+
+    // Hidden file input
+    const fileInput = contentEl.createEl("input", {
       type: "file",
+      cls: "notecap-file-input",
       attr: {
         accept: "image/*",
-        capture: "environment",
+        multiple: false,
       },
     });
 
-    inputEl.addEventListener("change", async (e: Event) => {
+    // Event Listeners
+    uploadBtn.addEventListener("click", () => {
+      fileInput.click();
+    });
+
+    cameraBtn.addEventListener("click", () => {
+      this.setupCamera(contentEl);
+    });
+
+    fileInput.addEventListener("change", async (e: Event) => {
       const target = e.target as HTMLInputElement;
       const file = target.files?.[0];
-
       if (file) {
-        try {
-          const buffer = await file.arrayBuffer();
-          const path = `${file.name}`;
-          await this.app.vault.createBinary(path, buffer);
-          this.close();
-        } catch (error) {
-          console.error("Error uploading file:", error);
-          new Notice("Error uploading file: " + error.message);
-        }
+        await this.processFile(file);
       }
     });
+
+    this.addStyles();
+  }
+
+  private addStyles() {
+    const style = document.createElement("style");
+    style.textContent = `
+      .notecap-buttons {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        padding: 20px;
+      }
+
+      .notecap-action-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background-color: var(--background-secondary-alt);
+        border: none;
+        border-radius: 8px;
+        padding: 20px;
+        height: 120px;
+        cursor: pointer;
+        color: var(--text-normal);
+        transition: background-color 0.2s ease;
+      }
+
+      .notecap-action-btn:hover {
+        background-color: var(--background-modifier-hover);
+      }
+
+      .notecap-icon {
+        width: 32px;
+        height: 32px;
+      }
+
+      .notecap-action-btn span {
+        font-size: 14px;
+      }
+
+      .notecap-file-input {
+        display: none;
+      }
+
+      /* Camera view styles */
+      .notecap-video {
+        width: 100%;
+        border-radius: 8px;
+        margin-top: 16px;
+      }
+
+      .notecap-capture-btn {
+        width: 100%;
+        margin-top: 16px;
+        padding: 12px;
+        background-color: var(--interactive-accent);
+        color: var(--text-on-accent);
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  private async setMode(mode: "upload" | "camera") {
+    this.captureMode = mode;
+    const inputContainer = this.contentEl.querySelector(".input-container");
+    if (inputContainer instanceof HTMLElement) {
+      // Type check added
+      inputContainer.empty();
+      this.updateInputContainer(inputContainer);
+    }
+  }
+
+  private updateInputContainer(container: HTMLElement) {
+    if (this.captureMode === "upload") {
+      const inputEl = container.createEl("input", {
+        type: "file",
+        attr: {
+          accept: "image/*",
+        },
+      });
+
+      inputEl.addEventListener("change", async (e: Event) => {
+        const target = e.target as HTMLInputElement;
+        const file = target.files?.[0];
+        if (file) {
+          await this.processFile(file);
+        }
+      });
+    } else {
+      this.setupCamera(container);
+    }
+  }
+  private async setupCamera(container: HTMLElement) {
+    try {
+      const videoEl = container.createEl("video", {
+        attr: {
+          autoplay: "true",
+          playsinline: "true",
+        },
+      });
+      videoEl.addClass("notecap-video");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false,
+      });
+
+      videoEl.srcObject = stream;
+
+      const captureBtn = container.createEl("button", {
+        text: "Capture Photo",
+        cls: "notecap-capture-btn",
+      });
+
+      captureBtn.addEventListener("click", () => {
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+
+        if (context && videoEl.videoWidth && videoEl.videoHeight) {
+          canvas.width = videoEl.videoWidth;
+          canvas.height = videoEl.videoHeight;
+          context.drawImage(videoEl, 0, 0);
+
+          canvas.toBlob(
+            async (blob) => {
+              if (blob) {
+                const file = new File([blob], `capture-${Date.now()}.jpg`, {
+                  type: "image/jpeg",
+                });
+                await this.processFile(file);
+
+                // Clean up
+                stream.getTracks().forEach((track) => track.stop());
+              }
+            },
+            "image/jpeg",
+            0.95
+          );
+        }
+      });
+    } catch (error) {
+      console.error("Camera setup error:", error);
+      new Notice("Failed to access camera. Please check permissions.");
+      this.setMode("upload");
+    }
+  }
+
+  private async processFile(file: File) {
+    try {
+      const buffer = await file.arrayBuffer();
+      const path = `${file.name}`;
+      await this.app.vault.createBinary(path, buffer);
+      this.close();
+    } catch (error) {
+      console.error("Error processing file:", error);
+      new Notice("Error processing file: " + error.message);
+    }
   }
 
   onClose() {
     const { contentEl } = this;
+    // Clean up video streams if they exist
+    const videoEl = contentEl.querySelector("video");
+    if (videoEl && videoEl.srcObject) {
+      (videoEl.srcObject as MediaStream)
+        .getTracks()
+        .forEach((track) => track.stop());
+    }
     contentEl.empty();
   }
 }
@@ -796,6 +1212,46 @@ class NoteCapSettingTab extends PluginSettingTab {
             })
         );
     }
+
+    new Setting(containerEl)
+      .setName("Output Folder")
+      .setDesc(
+        "Choose where to save processed notes (leave empty for vault root)"
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("/")
+          .setValue(this.plugin.settings.outputFolder)
+          .onChange(async (value) => {
+            // Only update the setting value on change, don't create folder yet
+            const normalizedPath = value
+              .replace(/\\/g, "/")
+              .replace(/\/+/g, "/");
+            this.plugin.settings.outputFolder = normalizedPath;
+            await this.plugin.saveSettings();
+          })
+          .then((text) => {
+            // Add blur event listener to create folder when user finishes typing
+            const inputEl = text.inputEl;
+            inputEl.addEventListener("blur", async () => {
+              const folderPath = this.plugin.settings.outputFolder.replace(
+                /^\/+|\/+$/g,
+                ""
+              );
+              if (folderPath) {
+                const folder = this.app.vault.getAbstractFileByPath(folderPath);
+                if (!folder) {
+                  try {
+                    await this.app.vault.createFolder(folderPath);
+                    new Notice(`Created folder: ${folderPath}`);
+                  } catch (error) {
+                    new Notice(`Failed to create folder: ${error.message}`);
+                  }
+                }
+              }
+            });
+          })
+      );
 
     new Setting(containerEl)
       .setName("Enable Auto Backlinks")
